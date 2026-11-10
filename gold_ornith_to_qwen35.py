@@ -74,18 +74,66 @@ def _():
     import importlib.util
     import subprocess
     import sys
+    import tempfile
+    from pathlib import Path
+
+    def _site_dirs_with(package: str) -> list[Path]:
+        """Directories on the import path that contain `package`, in import order."""
+        found = []
+        for entry in sys.path:
+            folder = Path(entry or ".").resolve()
+            if (folder / package / "__init__.py").exists() and folder not in found:
+                found.append(folder)
+        return found
 
     def ensure_packages(specs: dict[str, str]) -> None:
-        """Install packages whose import name is missing (molab normally installs from the script header)."""
+        """Install packages whose import name is missing, without ever installing a second copy of torch.
+
+        molab ships a GPU build of torch (with a matching torchvision) outside the notebook's virtual
+        environment, where uv cannot see it. Left alone, uv would pull a fresh torch in as a dependency of
+        transformers or peft; that copy shadows molab's and no longer matches torchvision. The override file
+        tells uv to skip those packages whenever torch is already importable.
+        """
         missing = [spec for name, spec in specs.items() if importlib.util.find_spec(name) is None]
         if not missing:
             return
         print("Installing:", missing, flush=True)
+        command = ["uv", "pip", "install", "--python", sys.executable]
+        if _site_dirs_with("torch"):
+            overrides = Path(tempfile.gettempdir()) / "gold_uv_overrides.txt"
+            overrides.write_text(
+                "".join(f"{name} ; sys_platform == 'never'\n" for name in ("torch", "torchvision", "torchaudio"))
+            )
+            command += ["--override", str(overrides)]
         try:
-            subprocess.run(["uv", "pip", "install", "--python", sys.executable, *missing], check=True)
+            subprocess.run([*command, *missing], check=True)
         except (FileNotFoundError, subprocess.CalledProcessError):
             subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=True)
         importlib.invalidate_caches()
+
+    def use_matched_torch() -> None:
+        """Repair an environment where torch and torchvision come from different installs.
+
+        Symptom: `RuntimeError: operator torchvision::nms does not exist` while importing transformers or peft.
+        """
+        torch_dirs, vision_dirs = _site_dirs_with("torch"), _site_dirs_with("torchvision")
+        if not torch_dirs or not vision_dirs or torch_dirs[0] == vision_dirs[0]:
+            return
+        if vision_dirs[0] in torch_dirs:
+            # torchvision's own torch is present but shadowed by a newer copy: remove the shadowing copy.
+            print(f"Removing the extra torch in {torch_dirs[0]} (torchvision belongs to {vision_dirs[0]}).", flush=True)
+            command = ["uv", "pip", "uninstall", "--python", sys.executable, "torch"]
+        else:
+            # No matching torch anywhere: install a torchvision that matches the active torch.
+            print(f"Installing a torchvision that matches the torch in {torch_dirs[0]}.", flush=True)
+            command = ["uv", "pip", "install", "--python", sys.executable, "torchvision"]
+        subprocess.run(command, check=True)
+        importlib.invalidate_caches()
+        if "torch" in sys.modules:
+            raise RuntimeError(
+                "Fixed a torch/torchvision mismatch, but the old torch is still loaded in this session. "
+                "Restart the kernel (notebook menu > Restart kernel) and run this cell again."
+            )
 
     ensure_packages(
         {
@@ -123,16 +171,17 @@ def _():
         except subprocess.CalledProcessError as err:
             print(f"Could not install flash-linear-attention ({err}); using the PyTorch fallback.", flush=True)
 
+    use_matched_torch()
+
     import gc
     import hashlib
     import json
     import math
     import random
-    import tempfile
     import textwrap
     import time
     from concurrent.futures import ThreadPoolExecutor
-    from pathlib import Path
+    from importlib.metadata import version as _version
     from types import SimpleNamespace
 
     import pandas as pd
@@ -150,6 +199,15 @@ def _():
         set_seed,
     )
     from trl.experimental.gold import GOLDConfig, GOLDTrainer
+
+    print(
+        f"torch {torch.__version__} from {Path(torch.__file__).parent.parent} | "
+        + " | ".join(f"{name} {_version(name)}" for name in ("transformers", "trl", "peft"))
+        + f" | CUDA available: {torch.cuda.is_available()}",
+        flush=True,
+    )
+    if not torch.cuda.is_available():
+        print("WARNING: no GPU visible. Attach the GPU from the notebook specs button before running.", flush=True)
 
     return (
         AutoModelForCausalLM,
@@ -792,7 +850,7 @@ def _(
 
 
 @app.cell
-def _(accuracy_ci, cached_json, cfg, mo, paired_test):
+def _(accuracy_ci, cached_json, cfg, log, mo, paired_test, pd):
     def reference_eval(domain: str, name: str, model, eval_fn) -> dict:
         """Evaluate an untrained model (teacher or student base) once and cache the result."""
         tag = f"{domain}_{name}"
@@ -842,6 +900,10 @@ def _(accuracy_ci, cached_json, cfg, mo, paired_test):
                         "mcnemar_p": round(test["p_value"], 4),
                     }
                 )
+        # Also print the tables, so they are visible in the logs and in the single-cell version.
+        log(f"{title}\n{pd.DataFrame(rows).to_string(index=False)}")
+        if comparisons:
+            log(f"Paired comparisons\n{pd.DataFrame(comparisons).to_string(index=False)}")
         parts = [mo.md(f"### {title}"), mo.ui.table(rows, selection=None)]
         if comparisons:
             parts.append(mo.ui.table(comparisons, selection=None))
